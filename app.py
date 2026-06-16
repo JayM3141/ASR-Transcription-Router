@@ -21,6 +21,12 @@ try:
 except Exception:
     NEMO_AVAILABLE = False
 
+try:
+    import speechbrain  # noqa: F401
+    SPEECHBRAIN_AVAILABLE = True
+except Exception:
+    SPEECHBRAIN_AVAILABLE = False
+
 HAS_CUDA = torch.cuda.is_available()
 device: str = "cuda:0" if HAS_CUDA else "cpu"
 torch_dtype: torch.dtype = torch.float16 if HAS_CUDA else torch.float32
@@ -28,9 +34,11 @@ torch_dtype: torch.dtype = torch.float16 if HAS_CUDA else torch.float32
 # ---------------------------------------------------------------------------
 # Model type constants
 # ---------------------------------------------------------------------------
-T_WHISPER  = "transformers_whisper"   # encoder-decoder Whisper-style
-T_GENERIC  = "transformers_generic"   # any other HF pipeline model
-T_NEMO     = "nemo"                   # NVIDIA NeMo toolkit
+T_WHISPER      = "transformers_whisper"  # encoder-decoder Whisper-style
+T_GENERIC      = "transformers_generic"  # any other HF pipeline model
+T_NEMO         = "nemo"                  # NVIDIA NeMo toolkit
+T_SPEECHBRAIN  = "speechbrain"           # SpeechBrain library
+T_UNSUPPORTED  = "unsupported"           # needs custom framework not yet wired up
 API_ASSEMBLYAI   = "api_assemblyai"
 API_ELEVENLABS   = "api_elevenlabs"
 API_REVAI        = "api_revai"
@@ -80,10 +88,11 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "facebook/seamless-m4t-v2-large":          {"type": T_GENERIC},
     "facebook/hubert-large-ls960-ft":          {"type": T_GENERIC},
     "facebook/hubert-xlarge-ls960-ft":         {"type": T_GENERIC},
-    "Voxpopuli":                               {"type": T_GENERIC},
+    "facebook/wav2vec2-base-10k-voxpopuli-ft-en": {"type": T_GENERIC},
     # ── Microsoft ───────────────────────────────────────────────────────
     "microsoft/speecht5_asr":                  {"type": T_GENERIC},
-    "microsoft/Phi-4-multimodal-instruct":     {"type": T_GENERIC},
+    "microsoft/Phi-4-multimodal-instruct":     {"type": T_UNSUPPORTED,
+                                                "reason": "Phi-4 multimodal requires a custom chat-style inference pipeline (not a standard ASR pipeline). Use the Azure Speech API or a Whisper model instead."},
     "microsoft/azure-speech-05-2026":          {"type": API_AZURE,        "label": "Azure Speech"},
     # ── Google ──────────────────────────────────────────────────────────
     "google/chirp_3":                          {"type": API_GOOGLE,       "label": "Google Chirp 3"},
@@ -95,8 +104,10 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "ibm-granite/granite-speech-3.3-2b":      {"type": T_GENERIC},
     "ibm-granite/granite-4.0-1b-speech":      {"type": T_GENERIC},
     # ── Mistral ─────────────────────────────────────────────────────────
-    "mistralai/Voxtral-Small-24B-2507":        {"type": T_GENERIC},
-    "mistralai/Voxtral-Mini-3B-2507":          {"type": T_GENERIC},
+    "mistralai/Voxtral-Small-24B-2507":        {"type": T_UNSUPPORTED,
+                                                "reason": "Voxtral is a multimodal LLM requiring vLLM or custom chat-style inference — not a standard ASR pipeline. Use a Whisper or Distil-Whisper model instead."},
+    "mistralai/Voxtral-Mini-3B-2507":          {"type": T_UNSUPPORTED,
+                                                "reason": "Voxtral is a multimodal LLM requiring vLLM or custom chat-style inference — not a standard ASR pipeline. Use a Whisper or Distil-Whisper model instead."},
     # ── Qwen ────────────────────────────────────────────────────────────
     "Qwen/Qwen3-ASR-1.7B":                     {"type": T_GENERIC},
     "Qwen/Qwen3-ASR-0.6B":                     {"type": T_GENERIC},
@@ -107,17 +118,20 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     # ── ZAI / GLM ───────────────────────────────────────────────────────
     "zai-org/GLM-ASR-Nano-2512":               {"type": T_GENERIC},
     # ── ESPnet / OWSM ───────────────────────────────────────────────────
-    "espnet/owsm_ctc_v4_1B":                   {"type": T_GENERIC},
-    "pyf98/owsm_ctc_v3.1_1B":                 {"type": T_GENERIC},
+    "espnet/owsm_ctc_v4_1B":                   {"type": T_UNSUPPORTED,
+                                                "reason": "ESPnet OWSM models use the ESPnet2 framework (`pip install espnet`). They are not loadable via the standard HuggingFace Transformers pipeline."},
+    "pyf98/owsm_ctc_v3.1_1B":                 {"type": T_UNSUPPORTED,
+                                                "reason": "ESPnet OWSM models use the ESPnet2 framework (`pip install espnet`). They are not loadable via the standard HuggingFace Transformers pipeline."},
     # ── SoundsgoodAI ────────────────────────────────────────────────────
-    "soundsgoodai/Zipformer-transducer-XL-290M": {"type": T_GENERIC},
+    "soundsgoodai/Zipformer-transducer-XL-290M": {"type": T_UNSUPPORTED,
+                                                   "reason": "Zipformer-transducer models use the k2/icefall framework and are not loadable via the standard HuggingFace Transformers pipeline."},
     # ── Useful Sensors ──────────────────────────────────────────────────
     "usefulsensors/moonshine-streaming-medium": {"type": T_GENERIC},
     # ── Wav2Vec2 / HuBERT ───────────────────────────────────────────────
     "jonatasgrosman/wav2vec2-large-xlsr-53-english": {"type": T_GENERIC},
     # ── SpeechBrain ─────────────────────────────────────────────────────
-    "speechbrain/asr-conformer-transformerlm-librispeech": {"type": T_GENERIC},
-    "speechbrain/asr-wav2vec2-librispeech":    {"type": T_GENERIC},
+    "speechbrain/asr-conformer-transformerlm-librispeech": {"type": T_SPEECHBRAIN, "sb_class": "EncoderDecoderASR"},
+    "speechbrain/asr-wav2vec2-librispeech":    {"type": T_SPEECHBRAIN, "sb_class": "EncoderASR"},
     # ── Commercial APIs ─────────────────────────────────────────────────
     "assemblyai/universal-3-pro":              {"type": API_ASSEMBLYAI,   "label": "AssemblyAI Universal-3 Pro"},
     "aquavoice/avalon-v1-en":                  {"type": API_GENERIC,      "label": "Aqua Voice Avalon"},
@@ -152,11 +166,11 @@ MODEL_GROUPS: Dict[str, List[str]] = {
     "🤫 OpenAI Whisper":           ["openai/whisper-large-v3-turbo","openai/whisper-large-v3","openai/whisper-large-v2","openai/whisper-medium","openai/whisper-small","openai/whisper-base","openai/whisper-tiny"],
     "⚡ Distil-Whisper":           ["distil-whisper/distil-large-v3.5","distil-whisper/distil-large-v3","distil-whisper/distil-medium.en","distil-whisper/distil-small.en","efficient-speech/lite-whisper-large-v3-acc"],
     "🟢 NVIDIA Parakeet/Canary":   ["nvidia/canary-qwen-2.5b","nvidia/canary-1b-v2","nvidia/canary-1b-flash","nvidia/canary-1b","nvidia/canary-180m-flash","nvidia/parakeet-tdt-0.6b-v3","nvidia/parakeet-tdt-1.1b","nvidia/parakeet-tdt-0.6b-v2","nvidia/parakeet-rnnt-1.1b","nvidia/parakeet-ctc-1.1b","nvidia/stt_en_conformer_transducer_small"],
-    "🦙 Meta / Facebook":          ["facebook/wav2vec2-large-960h-lv60-self","facebook/wav2vec2-base-960h","facebook/mms-300m","facebook/mms-1b-fl102","facebook/seamless-m4t-v2-large","Voxpopuli"],
-    "🪟 Microsoft":                ["microsoft/Phi-4-multimodal-instruct","microsoft/speecht5_asr","microsoft/azure-speech-05-2026"],
+    "🦙 Meta / Facebook":          ["facebook/wav2vec2-large-960h-lv60-self","facebook/wav2vec2-base-960h","facebook/mms-300m","facebook/mms-1b-fl102","facebook/seamless-m4t-v2-large","facebook/wav2vec2-base-10k-voxpopuli-ft-en"],
+    "🪟 Microsoft":                ["microsoft/speecht5_asr","microsoft/Phi-4-multimodal-instruct","microsoft/azure-speech-05-2026"],
     "🔍 Google":                   ["google/chirp_3","google/chirp_2"],
     "💎 IBM Granite Speech":       ["ibm-granite/granite-speech-4.1-2b-nar","ibm-granite/granite-speech-4.1-2b","ibm-granite/granite-speech-3.3-8b","ibm-granite/granite-speech-3.3-2b","ibm-granite/granite-4.0-1b-speech"],
-    "🌊 Mistral AI":               ["mistralai/Voxtral-Small-24B-2507","mistralai/Voxtral-Mini-3B-2507"],
+    "🌊 Mistral AI":               ["mistralai/Voxtral-Mini-3B-2507","mistralai/Voxtral-Small-24B-2507"],
     "🐲 Qwen":                     ["Qwen/Qwen3-ASR-1.7B","Qwen/Qwen3-ASR-0.6B"],
     "🎙️ ElevenLabs":              ["elevenlabs/scribe_v2","elevenlabs/scribe_v1"],
     "🎵 Kyutai":                   ["kyutai/stt-2.6b-en"],
@@ -174,7 +188,7 @@ MODEL_GROUPS: Dict[str, List[str]] = {
     "🎓 ESPnet / OWSM":            ["espnet/owsm_ctc_v4_1B","pyf98/owsm_ctc_v3.1_1B"],
     "🔈 SoundsgoodAI":             ["soundsgoodai/Zipformer-transducer-XL-290M"],
     "🧠 Wav2Vec2 / HuBERT":        ["facebook/hubert-large-ls960-ft","facebook/hubert-xlarge-ls960-ft","jonatasgrosman/wav2vec2-large-xlsr-53-english"],
-    "🗣️ SpeechBrain":              ["speechbrain/asr-conformer-transformerlm-librispeech","speechbrain/asr-wav2vec2-librispeech"],
+    "🗣️ SpeechBrain":              ["speechbrain/asr-wav2vec2-librispeech","speechbrain/asr-conformer-transformerlm-librispeech"],
 }
 
 DEFAULT_MODEL = "nyrahealth/CrisperWhisper"
@@ -222,6 +236,23 @@ def load_transformers_pipeline(model_id: str, arch: str) -> Any:
             device=device,
             torch_dtype=torch_dtype,
         )
+
+
+@st.cache_resource(show_spinner="Loading SpeechBrain model… this may take a few minutes on first run.")
+def load_speechbrain_model(model_id: str, sb_class: str) -> Any:
+    if not SPEECHBRAIN_AVAILABLE:
+        raise RuntimeError(
+            "SpeechBrain is not installed. Install it with:\n"
+            "`pip install speechbrain`\n\nThen restart the app."
+        )
+    try:
+        from speechbrain.inference.ASR import EncoderASR, EncoderDecoderASR
+    except ImportError:
+        from speechbrain.pretrained import EncoderASR, EncoderDecoderASR  # type: ignore[no-redef]
+    cls_map = {"EncoderASR": EncoderASR, "EncoderDecoderASR": EncoderDecoderASR}
+    cls = cls_map.get(sb_class, EncoderASR)
+    savedir = f"pretrained_models/{model_id.replace('/', '_')}"
+    return cls.from_hparams(source=model_id, savedir=savedir)
 
 
 @st.cache_resource(show_spinner="Loading NeMo model… this may take a few minutes on first run.")
@@ -293,6 +324,16 @@ def transcribe_nemo(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     waveform = process_audio_bytes(audio_bytes)  # saves sample.wav
     results = model.transcribe(["sample.wav"])
     text = results[0] if isinstance(results[0], str) else results[0].text
+    return {"text": text, "chunks": []}
+
+
+def transcribe_speechbrain(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
+    process_audio_bytes(audio_bytes)  # saves sample.wav
+    result = model.transcribe_file("sample.wav")
+    if isinstance(result, (list, tuple)):
+        text = " ".join(str(r) for r in result).strip()
+    else:
+        text = str(result).strip()
     return {"text": text, "chunks": []}
 
 
@@ -377,6 +418,10 @@ def transcribe_audio(
         return transcribe_transformers(audio_bytes, model_or_pipe)
     elif t == T_NEMO:
         return transcribe_nemo(audio_bytes, model_or_pipe)
+    elif t == T_SPEECHBRAIN:
+        return transcribe_speechbrain(audio_bytes, model_or_pipe)
+    elif t == T_UNSUPPORTED:
+        raise RuntimeError(active_info.get("reason", "This model requires a custom inference framework not yet integrated."))
     elif t == API_ASSEMBLYAI:
         key = api_keys.get("assemblyai_key", "")
         if not key:
@@ -452,6 +497,17 @@ st.sidebar.markdown(f"**Active:** `{active_model}`")
 if not is_api_type(active_type):
     st.sidebar.markdown(f"[🔗 View on HuggingFace](https://huggingface.co/{active_model})")
 
+# ── SpeechBrain info banner ───────────────────────────────────────────
+if active_type == T_SPEECHBRAIN:
+    if not SPEECHBRAIN_AVAILABLE:
+        st.sidebar.warning("⚠️ **SpeechBrain not installed.**\n\nRun: `pip install speechbrain`\n\nThen restart the app.")
+    else:
+        st.sidebar.info("🗣️ SpeechBrain model — runs on CPU")
+
+# ── Unsupported model banner ──────────────────────────────────────────
+if active_type == T_UNSUPPORTED:
+    st.sidebar.warning("⚠️ **Needs custom framework** — see main panel for details.")
+
 # ── NeMo info banner ──────────────────────────────────────────────────
 if active_type == T_NEMO:
     if not NEMO_AVAILABLE:
@@ -500,8 +556,12 @@ for api_type in sorted(api_types_present):
 model_badge = f"`{active_model}`"
 if active_type == T_NEMO:
     model_badge += " 🟢 NeMo"
+elif active_type == T_SPEECHBRAIN:
+    model_badge += " 🗣️ SpeechBrain"
+elif active_type == T_UNSUPPORTED:
+    model_badge += " ⚠️ Needs custom framework"
 elif is_api_type(active_type):
-    model_badge += f" 🔑 API"
+    model_badge += " 🔑 API"
 
 st.title("Open ASR Leaderboard Transcription 🦻")
 st.markdown(
@@ -518,12 +578,29 @@ if active_type == T_NEMO and not NEMO_AVAILABLE:
     )
     st.stop()
 
-# Load model/pipeline (skipped for pure API models)
+if active_type == T_SPEECHBRAIN and not SPEECHBRAIN_AVAILABLE:
+    st.error(
+        "**SpeechBrain is not installed.**\n\n"
+        "Install it with: `pip install speechbrain`\n\n"
+        "Once installed, restart the app."
+    )
+    st.stop()
+
+if active_type == T_UNSUPPORTED:
+    reason = active_info.get("reason", "This model requires a custom inference framework.")
+    st.warning(
+        f"**`{active_model}` is not directly loadable via this app.**\n\n{reason}"
+    )
+    st.stop()
+
+# Load model/pipeline (skipped for pure API models and unsupported models)
 model_or_pipe = None
-if not is_api_type(active_type):
+if active_type not in (T_UNSUPPORTED,) and not is_api_type(active_type):
     try:
         if active_type == T_NEMO:
             model_or_pipe = load_nemo_model(active_model, active_info.get("nemo_class", "ASRModel"))
+        elif active_type == T_SPEECHBRAIN:
+            model_or_pipe = load_speechbrain_model(active_model, active_info.get("sb_class", "EncoderASR"))
         else:
             model_or_pipe = load_transformers_pipeline(active_model, active_type)
     except Exception as load_err:
