@@ -1,6 +1,9 @@
 import argparse
 import io
 import os
+import runpy
+import subprocess
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Union
 
@@ -27,6 +30,36 @@ try:
 except Exception:
     SPEECHBRAIN_AVAILABLE = False
 
+try:
+    from transformers import VoxtralForConditionalGeneration  # noqa: F401
+    VOXTRAL_AVAILABLE = True
+except Exception:
+    VOXTRAL_AVAILABLE = False
+
+try:
+    from transformers import GlmAsrForConditionalGeneration  # noqa: F401
+    GLM_ASR_AVAILABLE = True
+except Exception:
+    GLM_ASR_AVAILABLE = False
+
+try:
+    import moshi  # noqa: F401
+    MOSHI_AVAILABLE = True
+except Exception:
+    MOSHI_AVAILABLE = False
+
+try:
+    import qwen_asr  # noqa: F401
+    QWEN_ASR_AVAILABLE = True
+except Exception:
+    QWEN_ASR_AVAILABLE = False
+
+try:
+    import espnet2  # noqa: F401
+    ESPNET_AVAILABLE = True
+except Exception:
+    ESPNET_AVAILABLE = False
+
 HAS_CUDA = torch.cuda.is_available()
 device: str = "cuda:0" if HAS_CUDA else "cpu"
 torch_dtype: torch.dtype = torch.float16 if HAS_CUDA else torch.float32
@@ -38,7 +71,14 @@ T_WHISPER      = "transformers_whisper"  # encoder-decoder Whisper-style
 T_GENERIC      = "transformers_generic"  # any other HF pipeline model
 T_NEMO         = "nemo"                  # NVIDIA NeMo toolkit
 T_SPEECHBRAIN  = "speechbrain"           # SpeechBrain library
-T_UNSUPPORTED  = "unsupported"           # needs custom framework not yet wired up
+T_VOXTRAL      = "voxtral"               # VoxtralForConditionalGeneration (mistral-common)
+T_GENERATE     = "generate"              # AutoModelForCausalLM / GlmAsrForConditionalGeneration
+T_GRANITE      = "granite"               # AutoModelForSpeechSeq2Seq + chat template
+T_TRUST        = "trust_remote"          # AutoModel trust_remote_code=True
+T_QWEN_ASR     = "qwen_asr"             # qwen_asr.Qwen3ASRModel
+T_KYUTAI       = "kyutai"               # moshi streaming ASR
+T_ESPNET       = "espnet"               # espnet2 / OWSM CTC
+T_ZIPFORMER    = "zipformer"            # k2/icefall (requires CUDA + k2)
 API_ASSEMBLYAI   = "api_assemblyai"
 API_ELEVENLABS   = "api_elevenlabs"
 API_REVAI        = "api_revai"
@@ -46,7 +86,7 @@ API_GOOGLE       = "api_google"
 API_AZURE        = "api_azure"
 API_COHERE       = "api_cohere"
 API_SPEECHMATICS = "api_speechmatics"
-API_GENERIC      = "api_generic"      # commercial API, no SDK yet
+API_GENERIC      = "api_generic"
 
 # ---------------------------------------------------------------------------
 # Model registry  –  type + per-model metadata
@@ -67,19 +107,20 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "distil-whisper/distil-large-v3":          {"type": T_WHISPER},
     "distil-whisper/distil-medium.en":         {"type": T_WHISPER},
     "distil-whisper/distil-small.en":          {"type": T_WHISPER},
-    "efficient-speech/lite-whisper-large-v3-acc": {"type": T_WHISPER},
+    # LiteASR: trust_remote_code + whisper-large-v3-turbo processor
+    "efficient-speech/lite-whisper-large-v3-acc": {"type": T_TRUST, "lite_asr": True},
     # ── NVIDIA NeMo ─────────────────────────────────────────────────────
-    "nvidia/canary-qwen-2.5b":                 {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel", "requires_gpu": False},
-    "nvidia/canary-1b-v2":                     {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel", "requires_gpu": False},
-    "nvidia/canary-1b-flash":                  {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel", "requires_gpu": False},
-    "nvidia/canary-1b":                        {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel", "requires_gpu": False},
-    "nvidia/canary-180m-flash":                {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel", "requires_gpu": False},
-    "nvidia/parakeet-tdt-0.6b-v3":             {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel",   "requires_gpu": False},
-    "nvidia/parakeet-tdt-1.1b":                {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel",   "requires_gpu": False},
-    "nvidia/parakeet-tdt-0.6b-v2":             {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel",   "requires_gpu": False},
-    "nvidia/parakeet-rnnt-1.1b":               {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel",   "requires_gpu": False},
-    "nvidia/parakeet-ctc-1.1b":                {"type": T_NEMO, "nemo_class": "EncDecCTCModelBPE",    "requires_gpu": False},
-    "nvidia/stt_en_conformer_transducer_small": {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel",  "requires_gpu": False},
+    "nvidia/canary-qwen-2.5b":                 {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel"},
+    "nvidia/canary-1b-v2":                     {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel"},
+    "nvidia/canary-1b-flash":                  {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel"},
+    "nvidia/canary-1b":                        {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel"},
+    "nvidia/canary-180m-flash":                {"type": T_NEMO, "nemo_class": "EncDecMultiTaskModel"},
+    "nvidia/parakeet-tdt-0.6b-v3":             {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel"},
+    "nvidia/parakeet-tdt-1.1b":                {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel"},
+    "nvidia/parakeet-tdt-0.6b-v2":             {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel"},
+    "nvidia/parakeet-rnnt-1.1b":               {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel"},
+    "nvidia/parakeet-ctc-1.1b":                {"type": T_NEMO, "nemo_class": "EncDecCTCModelBPE"},
+    "nvidia/stt_en_conformer_transducer_small": {"type": T_NEMO, "nemo_class": "EncDecRNNTBPEModel"},
     # ── Meta / Facebook ─────────────────────────────────────────────────
     "facebook/wav2vec2-large-960h-lv60-self":  {"type": T_GENERIC},
     "facebook/wav2vec2-base-960h":             {"type": T_GENERIC},
@@ -91,41 +132,36 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "facebook/wav2vec2-base-10k-voxpopuli-ft-en": {"type": T_GENERIC},
     # ── Microsoft ───────────────────────────────────────────────────────
     "microsoft/speecht5_asr":                  {"type": T_GENERIC},
-    "microsoft/Phi-4-multimodal-instruct":     {"type": T_UNSUPPORTED,
-                                                "reason": "Phi-4 multimodal requires a custom chat-style inference pipeline (not a standard ASR pipeline). Use the Azure Speech API or a Whisper model instead."},
+    # Phi-4: AutoModelForCausalLM + processor.apply_transcription_request
+    "microsoft/Phi-4-multimodal-instruct":     {"type": T_GENERATE, "gen_class": "AutoModelForCausalLM"},
     "microsoft/azure-speech-05-2026":          {"type": API_AZURE,        "label": "Azure Speech"},
     # ── Google ──────────────────────────────────────────────────────────
     "google/chirp_3":                          {"type": API_GOOGLE,       "label": "Google Chirp 3"},
     "google/chirp_2":                          {"type": API_GOOGLE,       "label": "Google Chirp 2"},
-    # ── IBM Granite ─────────────────────────────────────────────────────
-    "ibm-granite/granite-speech-4.1-2b-nar":  {"type": T_GENERIC},
-    "ibm-granite/granite-speech-4.1-2b":      {"type": T_GENERIC},
-    "ibm-granite/granite-speech-3.3-8b":      {"type": T_GENERIC},
-    "ibm-granite/granite-speech-3.3-2b":      {"type": T_GENERIC},
-    "ibm-granite/granite-4.0-1b-speech":      {"type": T_GENERIC},
-    # ── Mistral ─────────────────────────────────────────────────────────
-    "mistralai/Voxtral-Small-24B-2507":        {"type": T_UNSUPPORTED,
-                                                "reason": "Voxtral is a multimodal LLM requiring vLLM or custom chat-style inference — not a standard ASR pipeline. Use a Whisper or Distil-Whisper model instead."},
-    "mistralai/Voxtral-Mini-3B-2507":          {"type": T_UNSUPPORTED,
-                                                "reason": "Voxtral is a multimodal LLM requiring vLLM or custom chat-style inference — not a standard ASR pipeline. Use a Whisper or Distil-Whisper model instead."},
-    # ── Qwen ────────────────────────────────────────────────────────────
-    "Qwen/Qwen3-ASR-1.7B":                     {"type": T_GENERIC},
-    "Qwen/Qwen3-ASR-0.6B":                     {"type": T_GENERIC},
-    # ── Kyutai ──────────────────────────────────────────────────────────
-    "kyutai/stt-2.6b-en":                      {"type": T_GENERIC},
-    # ── Boson AI ────────────────────────────────────────────────────────
-    "bosonai/higgs-audio-v3-8b-stt-v2":        {"type": T_GENERIC},
-    # ── ZAI / GLM ───────────────────────────────────────────────────────
-    "zai-org/GLM-ASR-Nano-2512":               {"type": T_GENERIC},
-    # ── ESPnet / OWSM ───────────────────────────────────────────────────
-    "espnet/owsm_ctc_v4_1B":                   {"type": T_UNSUPPORTED,
-                                                "reason": "ESPnet OWSM models use the ESPnet2 framework (`pip install espnet`). They are not loadable via the standard HuggingFace Transformers pipeline."},
-    "pyf98/owsm_ctc_v3.1_1B":                 {"type": T_UNSUPPORTED,
-                                                "reason": "ESPnet OWSM models use the ESPnet2 framework (`pip install espnet`). They are not loadable via the standard HuggingFace Transformers pipeline."},
-    # ── SoundsgoodAI ────────────────────────────────────────────────────
-    "soundsgoodai/Zipformer-transducer-XL-290M": {"type": T_UNSUPPORTED,
-                                                   "reason": "Zipformer-transducer models use the k2/icefall framework and are not loadable via the standard HuggingFace Transformers pipeline."},
-    # ── Useful Sensors ──────────────────────────────────────────────────
+    # ── IBM Granite Speech (chat-template style) ─────────────────────────
+    "ibm-granite/granite-speech-4.1-2b-nar":  {"type": T_GRANITE},
+    "ibm-granite/granite-speech-4.1-2b":      {"type": T_GRANITE},
+    "ibm-granite/granite-speech-3.3-8b":      {"type": T_GRANITE},
+    "ibm-granite/granite-speech-3.3-2b":      {"type": T_GRANITE},
+    "ibm-granite/granite-4.0-1b-speech":      {"type": T_GRANITE},
+    # ── Mistral Voxtral ─────────────────────────────────────────────────
+    "mistralai/Voxtral-Small-24B-2507":        {"type": T_VOXTRAL},
+    "mistralai/Voxtral-Mini-3B-2507":          {"type": T_VOXTRAL},
+    # ── Qwen3-ASR (qwen_asr package) ────────────────────────────────────
+    "Qwen/Qwen3-ASR-1.7B":                     {"type": T_QWEN_ASR},
+    "Qwen/Qwen3-ASR-0.6B":                     {"type": T_QWEN_ASR},
+    # ── Kyutai STT (moshi library) ───────────────────────────────────────
+    "kyutai/stt-2.6b-en":                      {"type": T_KYUTAI},
+    # ── Boson AI HiggsAudio (trust_remote_code + transcribe.py) ─────────
+    "bosonai/higgs-audio-v3-8b-stt-v2":        {"type": T_TRUST, "higgs": True},
+    # ── ZAI / GLM ASR (GlmAsrForConditionalGeneration) ──────────────────
+    "zai-org/GLM-ASR-Nano-2512":               {"type": T_GENERATE, "gen_class": "GlmAsrForConditionalGeneration"},
+    # ── ESPnet / OWSM (espnet2 framework) ───────────────────────────────
+    "espnet/owsm_ctc_v4_1B":                   {"type": T_ESPNET},
+    "pyf98/owsm_ctc_v3.1_1B":                 {"type": T_ESPNET},
+    # ── SoundsgoodAI Zipformer (k2/icefall, CUDA required) ──────────────
+    "soundsgoodai/Zipformer-transducer-XL-290M": {"type": T_ZIPFORMER},
+    # ── Useful Sensors Moonshine ─────────────────────────────────────────
     "usefulsensors/moonshine-streaming-medium": {"type": T_GENERIC},
     # ── Wav2Vec2 / HuBERT ───────────────────────────────────────────────
     "jonatasgrosman/wav2vec2-large-xlsr-53-english": {"type": T_GENERIC},
@@ -170,30 +206,29 @@ MODEL_GROUPS: Dict[str, List[str]] = {
     "🪟 Microsoft":                ["microsoft/speecht5_asr","microsoft/Phi-4-multimodal-instruct","microsoft/azure-speech-05-2026"],
     "🔍 Google":                   ["google/chirp_3","google/chirp_2"],
     "💎 IBM Granite Speech":       ["ibm-granite/granite-speech-4.1-2b-nar","ibm-granite/granite-speech-4.1-2b","ibm-granite/granite-speech-3.3-8b","ibm-granite/granite-speech-3.3-2b","ibm-granite/granite-4.0-1b-speech"],
-    "🌊 Mistral AI":               ["mistralai/Voxtral-Mini-3B-2507","mistralai/Voxtral-Small-24B-2507"],
-    "🐲 Qwen":                     ["Qwen/Qwen3-ASR-1.7B","Qwen/Qwen3-ASR-0.6B"],
-    "🎙️ ElevenLabs":              ["elevenlabs/scribe_v2","elevenlabs/scribe_v1"],
+    "🌊 Mistral Voxtral":          ["mistralai/Voxtral-Mini-3B-2507","mistralai/Voxtral-Small-24B-2507"],
+    "🐲 Qwen3-ASR":                ["Qwen/Qwen3-ASR-0.6B","Qwen/Qwen3-ASR-1.7B"],
     "🎵 Kyutai":                   ["kyutai/stt-2.6b-en"],
+    "🤖 Boson AI HiggsAudio":      ["bosonai/higgs-audio-v3-8b-stt-v2"],
+    "🔵 ZAI / GLM ASR":            ["zai-org/GLM-ASR-Nano-2512"],
+    "🎓 ESPnet / OWSM":            ["espnet/owsm_ctc_v4_1B","pyf98/owsm_ctc_v3.1_1B"],
+    "🔈 SoundsgoodAI Zipformer":   ["soundsgoodai/Zipformer-transducer-XL-290M"],
+    "🌙 Useful Sensors":           ["usefulsensors/moonshine-streaming-medium"],
+    "🧠 Wav2Vec2 / HuBERT":        ["facebook/hubert-large-ls960-ft","facebook/hubert-xlarge-ls960-ft","jonatasgrosman/wav2vec2-large-xlsr-53-english"],
+    "🗣️ SpeechBrain":              ["speechbrain/asr-wav2vec2-librispeech","speechbrain/asr-conformer-transformerlm-librispeech"],
+    "🎙️ ElevenLabs":              ["elevenlabs/scribe_v2","elevenlabs/scribe_v1"],
     "📡 AssemblyAI":               ["assemblyai/universal-3-pro"],
     "🔊 Aqua Voice":               ["aquavoice/avalon-v1-en"],
-    "🤖 Boson AI":                 ["bosonai/higgs-audio-v3-8b-stt-v2"],
     "🧪 Cohere":                   ["CohereLabs/cohere-transcribe-03-2026"],
     "🔉 Reson8":                   ["reson8/resonant-1","reson8/resonant-1-flash"],
     "📝 Rev AI":                   ["revai/fusion"],
     "🎤 Speechmatics":             ["speechmatics/enhanced"],
     "🔬 Smallest AI":              ["smallestai/pulse"],
-    "🌙 Useful Sensors":           ["usefulsensors/moonshine-streaming-medium"],
     "📹 Zoom":                     ["zoom/scribe_v1"],
-    "🔵 ZAI / GLM":                ["zai-org/GLM-ASR-Nano-2512"],
-    "🎓 ESPnet / OWSM":            ["espnet/owsm_ctc_v4_1B","pyf98/owsm_ctc_v3.1_1B"],
-    "🔈 SoundsgoodAI":             ["soundsgoodai/Zipformer-transducer-XL-290M"],
-    "🧠 Wav2Vec2 / HuBERT":        ["facebook/hubert-large-ls960-ft","facebook/hubert-xlarge-ls960-ft","jonatasgrosman/wav2vec2-large-xlsr-53-english"],
-    "🗣️ SpeechBrain":              ["speechbrain/asr-wav2vec2-librispeech","speechbrain/asr-conformer-transformerlm-librispeech"],
 }
 
 DEFAULT_MODEL = "nyrahealth/CrisperWhisper"
 
-# All models flat list
 ALL_MODELS: List[str] = [m for models in MODEL_GROUPS.values() for m in models]
 
 def get_model_info(model_id: str) -> Dict[str, Any]:
@@ -204,7 +239,7 @@ def is_api_type(t: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline / model loading
+# Pipeline / model loading functions
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading model… this may take a few minutes on first run.")
 def load_transformers_pipeline(model_id: str, arch: str) -> Any:
@@ -241,10 +276,7 @@ def load_transformers_pipeline(model_id: str, arch: str) -> Any:
 @st.cache_resource(show_spinner="Loading SpeechBrain model… this may take a few minutes on first run.")
 def load_speechbrain_model(model_id: str, sb_class: str) -> Any:
     if not SPEECHBRAIN_AVAILABLE:
-        raise RuntimeError(
-            "SpeechBrain is not installed. Install it with:\n"
-            "`pip install speechbrain`\n\nThen restart the app."
-        )
+        raise RuntimeError("SpeechBrain is not installed. Run: pip install speechbrain")
     try:
         from speechbrain.inference.ASR import EncoderASR, EncoderDecoderASR
     except ImportError:
@@ -258,20 +290,191 @@ def load_speechbrain_model(model_id: str, sb_class: str) -> Any:
 @st.cache_resource(show_spinner="Loading NeMo model… this may take a few minutes on first run.")
 def load_nemo_model(model_id: str, nemo_class: str) -> Any:
     if not NEMO_AVAILABLE:
-        raise RuntimeError(
-            "NeMo toolkit is not installed. Install it with:\n"
-            "`pip install nemo_toolkit[asr]`\n\n"
-            "Then restart the app."
-        )
+        raise RuntimeError("NeMo toolkit is not installed. Run: pip install nemo_toolkit[asr]")
     cls_map = {
         "EncDecCTCModelBPE":    nemo_asr.models.EncDecCTCModelBPE,
         "EncDecRNNTBPEModel":   nemo_asr.models.EncDecRNNTBPEModel,
         "EncDecMultiTaskModel": nemo_asr.models.EncDecMultiTaskModel,
     }
-    model_cls = cls_map.get(nemo_class)
-    if model_cls is None:
-        model_cls = nemo_asr.models.ASRModel
+    model_cls = cls_map.get(nemo_class, nemo_asr.models.ASRModel)
     return model_cls.from_pretrained(model_name=model_id)
+
+
+@st.cache_resource(show_spinner="Loading Voxtral model… (large model, may take several minutes)")
+def load_voxtral_model(model_id: str) -> Any:
+    """Load Voxtral using VoxtralForConditionalGeneration per the leaderboard backend."""
+    if not VOXTRAL_AVAILABLE:
+        raise RuntimeError(
+            "VoxtralForConditionalGeneration is not available in your transformers version.\n"
+            "Run: pip install transformers --upgrade\n"
+            "Also required: pip install 'mistral-common[audio]>=1.9.0'"
+        )
+    try:
+        from transformers import VoxtralForConditionalGeneration, AutoProcessor
+    except ImportError as e:
+        raise RuntimeError(f"Failed to import Voxtral classes: {e}")
+    proc = AutoProcessor.from_pretrained(model_id)
+    model = VoxtralForConditionalGeneration.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        device_map=device,
+    )
+    model.eval()
+    return (model, proc)
+
+
+@st.cache_resource(show_spinner="Loading model… this may take a few minutes on first run.")
+def load_generate_model(model_id: str, gen_class: str = "AutoModelForCausalLM") -> Any:
+    """Load generative models (Phi-4, GLM ASR) using apply_transcription_request pattern."""
+    import transformers as _tr
+    proc = _tr.AutoProcessor.from_pretrained(model_id)
+    ModelCls = getattr(_tr, gen_class, None)
+    if ModelCls is None:
+        raise RuntimeError(
+            f"Model class `{gen_class}` not found in your transformers version ({_tr.__version__}).\n"
+            f"Run: pip install transformers --upgrade"
+        )
+    model = ModelCls.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        device_map=device,
+    )
+    model.eval()
+    return (model, proc)
+
+
+@st.cache_resource(show_spinner="Loading IBM Granite Speech model… this may take a few minutes.")
+def load_granite_model(model_id: str) -> Any:
+    """Load IBM Granite Speech using chat-template style inference per the leaderboard."""
+    from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+    proc = AutoProcessor.from_pretrained(model_id)
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        device_map=device,
+    )
+    model.eval()
+    return (model, proc)
+
+
+@st.cache_resource(show_spinner="Loading model with trust_remote_code… this may take a few minutes.")
+def load_trust_remote_model(model_id: str, info: Dict[str, Any]) -> Any:
+    """Load models that require trust_remote_code=True (HiggsAudio, LiteASR)."""
+    from transformers import AutoModel, AutoProcessor
+    is_lite = info.get("lite_asr", False)
+    if is_lite:
+        proc = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    else:
+        try:
+            proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        except Exception:
+            proc = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    model = AutoModel.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if HAS_CUDA else torch.float32,
+        trust_remote_code=True,
+        device_map=device,
+    )
+    model.eval()
+    return (model, proc)
+
+
+@st.cache_resource(show_spinner="Loading Qwen3-ASR model… this may take a few minutes.")
+def load_qwen_asr_model(model_id: str) -> Any:
+    """Load Qwen3-ASR via the qwen_asr package per the leaderboard."""
+    if not QWEN_ASR_AVAILABLE:
+        # Try to install qwen_asr
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "qwen_asr", "--no-deps", "-q"],
+                timeout=120,
+            )
+        except Exception:
+            pass
+        try:
+            import qwen_asr as _qa  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "qwen_asr package is not installed.\n"
+                "Run: pip install qwen_asr\n"
+                "Then restart the app."
+            )
+    from qwen_asr import Qwen3ASRModel
+    model = Qwen3ASRModel.from_pretrained(
+        model_id,
+        dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        device_map=device,
+    )
+    return model
+
+
+@st.cache_resource(show_spinner="Loading Kyutai STT model via moshi… this may take several minutes.")
+def load_kyutai_model(model_id: str) -> Any:
+    """Load Kyutai STT using the moshi library per the leaderboard."""
+    if not MOSHI_AVAILABLE:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "moshi", "julius", "-q"],
+                timeout=180,
+            )
+        except Exception:
+            pass
+        try:
+            import moshi  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "moshi package is not installed.\n"
+                "Run: pip install moshi julius\n"
+                "Then restart the app."
+            )
+    from moshi import models as moshi_models
+    moshi_device = "cuda" if HAS_CUDA else "cpu"
+    moshi_dtype = torch.bfloat16 if HAS_CUDA else torch.float32
+    info = moshi_models.loaders.CheckpointInfo.from_hf_repo(model_id)
+    mimi = info.get_mimi(device=moshi_device)
+    tokenizer = info.get_text_tokenizer()
+    lm = info.get_moshi(device=moshi_device, dtype=moshi_dtype)
+    lm_gen = moshi_models.LMGen(lm, temp=0, temp_text=0.0)
+    padding_token_id = info.raw_config.get("text_padding_token_id", 3)
+    silence_prefix_s = info.stt_config.get("audio_silence_prefix_seconds", 1.0)
+    delay_s = info.stt_config.get("audio_delay_seconds", 5.0)
+    return (mimi, tokenizer, lm, lm_gen, padding_token_id, silence_prefix_s, delay_s)
+
+
+@st.cache_resource(show_spinner="Loading ESPnet OWSM model… this may take several minutes.")
+def load_espnet_model(model_id: str) -> Any:
+    """Load ESPnet OWSM CTC model using espnet2 per the leaderboard."""
+    if not ESPNET_AVAILABLE:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install",
+                 "espnet @ git+https://github.com/espnet/espnet",
+                 "espnet_model_zoo @ git+https://github.com/espnet/espnet_model_zoo",
+                 "-q"],
+                timeout=300,
+            )
+        except Exception:
+            pass
+        try:
+            import espnet2  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "ESPnet is not installed.\n"
+                "Run: pip install 'espnet @ git+https://github.com/espnet/espnet'\n"
+                "Then restart the app."
+            )
+    from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
+    load_args: Dict[str, Any] = {
+        "device": "cpu",
+        "dtype": "float32",
+        "lang_sym": "<eng>",
+        "task_sym": "<asr>",
+    }
+    if os.path.exists(model_id):
+        load_args["s2t_model_file"] = model_id
+    else:
+        load_args["model_tag"] = model_id
+    return Speech2TextGreedySearch.from_pretrained(**load_args)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +516,7 @@ def timestamps_to_vtt(timestamps: List[Dict[str, Any]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Transcription dispatch
+# Transcription functions per model type
 # ---------------------------------------------------------------------------
 def transcribe_transformers(audio_bytes: bytes, pipe: Any) -> Dict[str, Any]:
     waveform = process_audio_bytes(audio_bytes)
@@ -321,20 +524,207 @@ def transcribe_transformers(audio_bytes: bytes, pipe: Any) -> Dict[str, Any]:
 
 
 def transcribe_nemo(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
-    waveform = process_audio_bytes(audio_bytes)  # saves sample.wav
+    process_audio_bytes(audio_bytes)
     results = model.transcribe(["sample.wav"])
     text = results[0] if isinstance(results[0], str) else results[0].text
     return {"text": text, "chunks": []}
 
 
 def transcribe_speechbrain(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
-    process_audio_bytes(audio_bytes)  # saves sample.wav
+    process_audio_bytes(audio_bytes)
     result = model.transcribe_file("sample.wav")
     if isinstance(result, (list, tuple)):
         text = " ".join(str(r) for r in result).strip()
     else:
         text = str(result).strip()
     return {"text": text, "chunks": []}
+
+
+def transcribe_voxtral(audio_bytes: bytes, model_and_proc: Any, model_id: str) -> Dict[str, Any]:
+    """Voxtral: processor.apply_transcription_request per leaderboard voxtral/run_eval.py"""
+    model, proc = model_and_proc
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+    inputs = proc.apply_transcription_request(
+        language="en",
+        audio=audio_np,
+        model_id=model_id,
+    )
+    inputs = inputs.to(model.device, dtype=torch.bfloat16 if HAS_CUDA else torch.float32)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=448)
+    decoded = proc.batch_decode(
+        outputs[:, inputs.input_ids.shape[1]:],
+        skip_special_tokens=True,
+    )
+    return {"text": decoded[0].strip() if decoded else "", "chunks": []}
+
+
+def transcribe_generate(audio_bytes: bytes, model_and_proc: Any) -> Dict[str, Any]:
+    """Phi-4 / GLM ASR: processor.apply_transcription_request(audios) per leaderboard phi/ and glm_asr/."""
+    model, proc = model_and_proc
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+    inputs = proc.apply_transcription_request([audio_np])
+    inputs = inputs.to(model.device, dtype=model.dtype)
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=448, do_sample=False)
+    input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
+    decoded = proc.batch_decode(outputs[:, input_len:], skip_special_tokens=True)
+    return {"text": decoded[0].strip() if decoded else "", "chunks": []}
+
+
+def transcribe_granite(audio_bytes: bytes, model_and_proc: Any) -> Dict[str, Any]:
+    """IBM Granite Speech: chat-template + AutoModelForSpeechSeq2Seq per leaderboard granite/run_eval.py"""
+    model, proc = model_and_proc
+    tokenizer = proc.tokenizer
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+
+    chat = [
+        {
+            "role": "system",
+            "content": (
+                "Knowledge Cutoff Date: April 2024.\n"
+                "Today's Date: December 19, 2024.\n"
+                "You are Granite, developed by IBM. You are a helpful AI assistant"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "<|audio|>can you transcribe the speech into a written format?",
+        },
+    ]
+    text_prompt = tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=True
+    )
+
+    model_inputs = proc(
+        [text_prompt],
+        [audio_np],
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **model_inputs,
+            bos_token_id=tokenizer.bos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            max_new_tokens=448,
+        )
+
+    num_input_tokens = model_inputs["input_ids"].shape[-1]
+    new_tokens = outputs[:, num_input_tokens:]
+    text_out = tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
+    return {"text": text_out[0].strip() if text_out else "", "chunks": []}
+
+
+def transcribe_trust_remote(audio_bytes: bytes, model_and_proc: Any, info: Dict[str, Any]) -> Dict[str, Any]:
+    """HiggsAudio / LiteASR: AutoModel trust_remote_code per leaderboard higgs_audio/ and liteASR/."""
+    model, proc = model_and_proc
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+
+    is_higgs = info.get("higgs", False)
+    is_lite = info.get("lite_asr", False)
+
+    if is_higgs:
+        # HiggsAudio: dynamically load transcribe_batch from the model repo
+        from transformers.utils import cached_file
+        from transformers import AutoTokenizer
+        model_id = info.get("_model_id", "bosonai/higgs-audio-v3-8b-stt-v2")
+        path = cached_file(model_id, "transcribe.py")
+        module_dir = os.path.dirname(path)
+        sys.path.insert(0, module_dir)
+        try:
+            module_globals = runpy.run_path(path)
+        finally:
+            if module_dir in sys.path:
+                sys.path.remove(module_dir)
+        transcribe_batch_fn = module_globals["transcribe_batch"]
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        results = transcribe_batch_fn(model, tokenizer, [(audio_np, 16000)])
+        text = results[0] if results else ""
+        return {"text": text.strip() if text else "", "chunks": []}
+    else:
+        # LiteASR: standard whisper-processor + model.generate()
+        inputs = proc(audio_np, return_tensors="pt", sampling_rate=16000)
+        inputs = inputs.to(model.device, dtype=torch.float16 if HAS_CUDA else torch.float32)
+        with torch.no_grad():
+            if hasattr(model, "can_generate") and model.can_generate():
+                outputs = model.generate(**inputs, max_new_tokens=224)
+                text = proc.batch_decode(outputs, skip_special_tokens=True)[0]
+            else:
+                logits = model(**inputs).logits
+                predicted_ids = torch.argmax(logits, dim=-1)
+                text = proc.batch_decode(predicted_ids, skip_special_tokens=True)[0]
+        return {"text": text.strip(), "chunks": []}
+
+
+def transcribe_qwen_asr(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
+    """Qwen3-ASR: Qwen3ASRModel.transcribe per leaderboard qwen/run_eval.py"""
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+    audio_inputs = [(audio_np, 16000)]
+    results = model.transcribe(audio=audio_inputs, language="English")
+    text = results[0].text if results else ""
+    return {"text": text.strip(), "chunks": []}
+
+
+def transcribe_kyutai(audio_bytes: bytes, model_components: Any) -> Dict[str, Any]:
+    """Kyutai STT: moshi streaming inference per leaderboard kyutai/run_eval.py"""
+    import julius
+    mimi, tokenizer, _lm, lm_gen, padding_token_id, silence_prefix_s, delay_s = model_components
+    moshi_device = "cuda" if HAS_CUDA else "cpu"
+
+    waveform = process_audio_bytes(audio_bytes)
+    audio_16k = waveform[0]
+    # Resample from 16kHz to 24kHz (moshi native rate)
+    audio_24k = julius.resample.resample_frac(audio_16k, old_sr=16000, new_sr=24000)
+    # Pad with silence prefix and delay
+    audio_padded = torch.nn.functional.pad(
+        audio_24k,
+        (int(silence_prefix_s * 24000), int(delay_s * 24000)),
+    ).unsqueeze(0).to(moshi_device)
+
+    mimi_frame_size = mimi.frame_size
+    target_len = audio_padded.shape[-1]
+    if target_len % mimi_frame_size != 0:
+        pad_len = mimi_frame_size - (target_len % mimi_frame_size)
+        audio_padded = torch.nn.functional.pad(audio_padded, (0, pad_len))
+
+    text_tokens: List[int] = []
+    with torch.inference_mode():
+        # Encode audio into mimi codes frame by frame and run language model
+        with mimi.streaming(1):
+            for offset in range(0, audio_padded.shape[-1], mimi_frame_size):
+                chunk = audio_padded[:, :, offset:offset + mimi_frame_size]
+                codes = mimi.encode(chunk)  # (1, K, T)
+                for t in range(codes.shape[-1]):
+                    audio_tokens = codes[:, :, t:t+1]
+                    lm_gen_out = lm_gen.step(audio_tokens)
+                    if lm_gen_out is not None:
+                        text_t = lm_gen_out[0, 0].item()
+                        if text_t != padding_token_id:
+                            text_tokens.append(text_t)
+
+    text = tokenizer.decode(text_tokens) if text_tokens else ""
+    return {"text": text.strip(), "chunks": []}
+
+
+def transcribe_espnet(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
+    """ESPnet OWSM CTC: Speech2TextGreedySearch.batch_decode per leaderboard espnet/run_eval.py"""
+    waveform = process_audio_bytes(audio_bytes)
+    audio_np = waveform[0].numpy()
+    with torch.inference_mode():
+        pred_text = model.batch_decode(
+            [audio_np],
+            batch_size=1,
+            context_len_in_secs=4,
+        )
+    text = pred_text[0] if pred_text else ""
+    return {"text": text.strip(), "chunks": []}
 
 
 def transcribe_assemblyai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
@@ -379,13 +769,13 @@ def transcribe_elevenlabs(audio_bytes: bytes, api_key: str, model_id: str) -> Di
 
 def transcribe_revai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
     from rev_ai import apiclient
+    import time
     client = apiclient.RevAiAPIClient(api_key)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name
     try:
         job = client.submit_job_local_file(tmp_path)
-        import time
         while True:
             details = client.get_job_details(job.id)
             if details.status.name in ("transcribed", "failed"):
@@ -410,9 +800,9 @@ def transcribe_audio(
     model_id: str,
     model_or_pipe: Any,
     api_keys: Dict[str, str],
+    active_info: Dict[str, Any],
 ) -> Dict[str, Any]:
-    info = get_model_info(model_id)
-    t = info["type"]
+    t = active_info["type"]
 
     if t in (T_WHISPER, T_GENERIC):
         return transcribe_transformers(audio_bytes, model_or_pipe)
@@ -420,8 +810,28 @@ def transcribe_audio(
         return transcribe_nemo(audio_bytes, model_or_pipe)
     elif t == T_SPEECHBRAIN:
         return transcribe_speechbrain(audio_bytes, model_or_pipe)
-    elif t == T_UNSUPPORTED:
-        raise RuntimeError(active_info.get("reason", "This model requires a custom inference framework not yet integrated."))
+    elif t == T_VOXTRAL:
+        return transcribe_voxtral(audio_bytes, model_or_pipe, model_id)
+    elif t == T_GENERATE:
+        return transcribe_generate(audio_bytes, model_or_pipe)
+    elif t == T_GRANITE:
+        return transcribe_granite(audio_bytes, model_or_pipe)
+    elif t == T_TRUST:
+        _info = dict(active_info)
+        _info["_model_id"] = model_id
+        return transcribe_trust_remote(audio_bytes, model_or_pipe, _info)
+    elif t == T_QWEN_ASR:
+        return transcribe_qwen_asr(audio_bytes, model_or_pipe)
+    elif t == T_KYUTAI:
+        return transcribe_kyutai(audio_bytes, model_or_pipe)
+    elif t == T_ESPNET:
+        return transcribe_espnet(audio_bytes, model_or_pipe)
+    elif t == T_ZIPFORMER:
+        raise RuntimeError(
+            "**Zipformer (k2/icefall)** requires the `k2` library which is only available "
+            "for CUDA 12.4 (GPU). This model cannot run on CPU-only systems.\n\n"
+            "To use this model, you need a machine with an NVIDIA GPU and CUDA 12.4 installed."
+        )
     elif t == API_ASSEMBLYAI:
         key = api_keys.get("assemblyai_key", "")
         if not key:
@@ -438,17 +848,15 @@ def transcribe_audio(
             raise RuntimeError("Rev AI API key is required. Enter it in the sidebar.")
         return transcribe_revai(audio_bytes, key)
     else:
-        provider_label = info.get("label", model_id)
+        provider_label = active_info.get("label", model_id)
         raise RuntimeError(
             f"**{provider_label}** is a commercial API model. "
-            "Direct API integration for this provider is not yet implemented. "
-            "Please use the custom model ID field to enter a HuggingFace-hosted alternative, "
-            "or contact the provider for API access."
+            "Please contact the provider for API access."
         )
 
 
 # ---------------------------------------------------------------------------
-# CLI arg (kept for workflow launch compat – used as sidebar default)
+# CLI arg (kept for workflow launch compat)
 # ---------------------------------------------------------------------------
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -474,11 +882,26 @@ for models in MODEL_GROUPS.values():
 
 default_idx = group_display.index(cli_default) if cli_default in group_display else 0
 
+TYPE_BADGE = {
+    T_WHISPER:     "WHISPER",
+    T_GENERIC:     "HF",
+    T_NEMO:        "NeMo",
+    T_SPEECHBRAIN: "SpeechBrain",
+    T_VOXTRAL:     "Voxtral",
+    T_GENERATE:    "Generate",
+    T_GRANITE:     "Granite",
+    T_TRUST:       "TrustRemote",
+    T_QWEN_ASR:    "Qwen-ASR",
+    T_KYUTAI:      "Kyutai",
+    T_ESPNET:      "ESPnet",
+    T_ZIPFORMER:   "Zipformer",
+}
+
 selected_model = st.sidebar.selectbox(
     "Select a model",
     options=group_display,
     index=default_idx,
-    format_func=lambda m: f"{m}  [{get_model_info(m)['type'].upper().replace('TRANSFORMERS_','').replace('_',' ')}]",
+    format_func=lambda m: f"{m}  [{TYPE_BADGE.get(get_model_info(m)['type'], get_model_info(m)['type'].upper())}]",
     help="Switch between ASR models.",
 )
 
@@ -497,28 +920,55 @@ st.sidebar.markdown(f"**Active:** `{active_model}`")
 if not is_api_type(active_type):
     st.sidebar.markdown(f"[🔗 View on HuggingFace](https://huggingface.co/{active_model})")
 
-# ── SpeechBrain info banner ───────────────────────────────────────────
+# ── Framework info banners ────────────────────────────────────────────
 if active_type == T_SPEECHBRAIN:
     if not SPEECHBRAIN_AVAILABLE:
-        st.sidebar.warning("⚠️ **SpeechBrain not installed.**\n\nRun: `pip install speechbrain`\n\nThen restart the app.")
+        st.sidebar.warning("⚠️ SpeechBrain not installed. Run: `pip install speechbrain`")
     else:
-        st.sidebar.info("🗣️ SpeechBrain model — runs on CPU")
+        st.sidebar.info("🗣️ SpeechBrain model")
 
-# ── Unsupported model banner ──────────────────────────────────────────
-if active_type == T_UNSUPPORTED:
-    st.sidebar.warning("⚠️ **Needs custom framework** — see main panel for details.")
-
-# ── NeMo info banner ──────────────────────────────────────────────────
 if active_type == T_NEMO:
     if not NEMO_AVAILABLE:
-        st.sidebar.warning(
-            "⚠️ **NeMo not installed.**\n\n"
-            "Run: `pip install nemo_toolkit[asr]`\n\n"
-            "Then restart the app."
-        )
+        st.sidebar.warning("⚠️ NeMo not installed. Run: `pip install nemo_toolkit[asr]`")
     else:
-        gpu_note = "GPU available ✅" if HAS_CUDA else "CPU only — no CUDA needed for CPU path"
-        st.sidebar.info(f"NeMo model — {gpu_note}")
+        st.sidebar.info(f"🟢 NeMo model — {'GPU ✅' if HAS_CUDA else 'CPU'}")
+
+if active_type == T_VOXTRAL:
+    if not VOXTRAL_AVAILABLE:
+        st.sidebar.warning("⚠️ Upgrade transformers: `pip install transformers --upgrade`\nAlso: `pip install 'mistral-common[audio]>=1.9.0'`")
+    else:
+        st.sidebar.info("🌊 Voxtral — VoxtralForConditionalGeneration")
+
+if active_type == T_GENERATE:
+    gen_cls = active_info.get("gen_class", "AutoModelForCausalLM")
+    st.sidebar.info(f"⚡ Loaded via `{gen_cls}` + `apply_transcription_request`")
+
+if active_type == T_GRANITE:
+    st.sidebar.info("💎 IBM Granite Speech — chat-template inference")
+
+if active_type == T_TRUST:
+    st.sidebar.info("🔒 Loaded with `trust_remote_code=True`")
+
+if active_type == T_QWEN_ASR:
+    if not QWEN_ASR_AVAILABLE:
+        st.sidebar.warning("⚠️ qwen_asr package not installed. Will attempt install on load.")
+    else:
+        st.sidebar.info("🐲 Qwen3-ASR via qwen_asr package")
+
+if active_type == T_KYUTAI:
+    if not MOSHI_AVAILABLE:
+        st.sidebar.warning("⚠️ moshi package not installed. Will attempt install on load.")
+    else:
+        st.sidebar.info("🎵 Kyutai STT via moshi streaming inference")
+
+if active_type == T_ESPNET:
+    if not ESPNET_AVAILABLE:
+        st.sidebar.warning("⚠️ ESPnet not installed. Will attempt install on load.")
+    else:
+        st.sidebar.info("🎓 ESPnet OWSM CTC via espnet2")
+
+if active_type == T_ZIPFORMER:
+    st.sidebar.error("🔴 Zipformer requires k2 (CUDA 12.4 + GPU). Cannot run on CPU-only systems.")
 
 # ── API key inputs ─────────────────────────────────────────────────────
 st.sidebar.markdown("---")
@@ -527,7 +977,6 @@ st.sidebar.markdown("**🔑 API Keys** *(stored in session only)*")
 if "api_keys" not in st.session_state:
     st.session_state.api_keys = {}
 
-# Show key input for active API model, plus allow pre-filling others
 api_types_present = {get_model_info(m)["type"] for m in ALL_MODELS if is_api_type(get_model_info(m)["type"])}
 for api_type in sorted(api_types_present):
     cfg = API_KEY_CONFIG.get(api_type)
@@ -554,14 +1003,22 @@ for api_type in sorted(api_types_present):
 # Main UI
 # ---------------------------------------------------------------------------
 model_badge = f"`{active_model}`"
-if active_type == T_NEMO:
-    model_badge += " 🟢 NeMo"
-elif active_type == T_SPEECHBRAIN:
-    model_badge += " 🗣️ SpeechBrain"
-elif active_type == T_UNSUPPORTED:
-    model_badge += " ⚠️ Needs custom framework"
-elif is_api_type(active_type):
+badge_map = {
+    T_NEMO:        " 🟢 NeMo",
+    T_SPEECHBRAIN: " 🗣️ SpeechBrain",
+    T_VOXTRAL:     " 🌊 Voxtral",
+    T_GENERATE:    " ⚡ Generate",
+    T_GRANITE:     " 💎 Granite",
+    T_TRUST:       " 🔒 TrustRemote",
+    T_QWEN_ASR:    " 🐲 Qwen-ASR",
+    T_KYUTAI:      " 🎵 Kyutai",
+    T_ESPNET:      " 🎓 ESPnet",
+    T_ZIPFORMER:   " ⚠️ Needs GPU+CUDA",
+}
+if is_api_type(active_type):
     model_badge += " 🔑 API"
+elif active_type in badge_map:
+    model_badge += badge_map[active_type]
 
 st.title("Open ASR Leaderboard Transcription 🦻")
 st.markdown(
@@ -571,36 +1028,44 @@ st.markdown(
 
 # Block early if requirements clearly not met
 if active_type == T_NEMO and not NEMO_AVAILABLE:
-    st.error(
-        "**NeMo toolkit is not installed.**\n\n"
-        "Install it with: `pip install nemo_toolkit[asr]`\n\n"
-        "Once installed, restart the app."
-    )
+    st.error("**NeMo toolkit is not installed.**\n\nInstall it with: `pip install nemo_toolkit[asr]`\n\nThen restart the app.")
     st.stop()
 
 if active_type == T_SPEECHBRAIN and not SPEECHBRAIN_AVAILABLE:
+    st.error("**SpeechBrain is not installed.**\n\nInstall it with: `pip install speechbrain`\n\nThen restart the app.")
+    st.stop()
+
+if active_type == T_ZIPFORMER:
     st.error(
-        "**SpeechBrain is not installed.**\n\n"
-        "Install it with: `pip install speechbrain`\n\n"
-        "Once installed, restart the app."
+        "**Zipformer (k2/icefall) requires a CUDA-capable GPU.**\n\n"
+        "The `k2` library is only distributed for CUDA 12.4 (GPU) and cannot run on CPU-only systems. "
+        "To use this model, you need an NVIDIA GPU with CUDA 12.4 installed.\n\n"
+        "**Alternative:** Try a Whisper or Distil-Whisper model for CPU-compatible transcription."
     )
     st.stop()
 
-if active_type == T_UNSUPPORTED:
-    reason = active_info.get("reason", "This model requires a custom inference framework.")
-    st.warning(
-        f"**`{active_model}` is not directly loadable via this app.**\n\n{reason}"
-    )
-    st.stop()
-
-# Load model/pipeline (skipped for pure API models and unsupported models)
+# Load model/pipeline (skipped for pure API models)
 model_or_pipe = None
-if active_type not in (T_UNSUPPORTED,) and not is_api_type(active_type):
+if not is_api_type(active_type):
     try:
         if active_type == T_NEMO:
             model_or_pipe = load_nemo_model(active_model, active_info.get("nemo_class", "ASRModel"))
         elif active_type == T_SPEECHBRAIN:
             model_or_pipe = load_speechbrain_model(active_model, active_info.get("sb_class", "EncoderASR"))
+        elif active_type == T_VOXTRAL:
+            model_or_pipe = load_voxtral_model(active_model)
+        elif active_type == T_GENERATE:
+            model_or_pipe = load_generate_model(active_model, active_info.get("gen_class", "AutoModelForCausalLM"))
+        elif active_type == T_GRANITE:
+            model_or_pipe = load_granite_model(active_model)
+        elif active_type == T_TRUST:
+            model_or_pipe = load_trust_remote_model(active_model, active_info)
+        elif active_type == T_QWEN_ASR:
+            model_or_pipe = load_qwen_asr_model(active_model)
+        elif active_type == T_KYUTAI:
+            model_or_pipe = load_kyutai_model(active_model)
+        elif active_type == T_ESPNET:
+            model_or_pipe = load_espnet_model(active_model)
         else:
             model_or_pipe = load_transformers_pipeline(active_model, active_type)
     except Exception as load_err:
@@ -609,7 +1074,6 @@ if active_type not in (T_UNSUPPORTED,) and not is_api_type(active_type):
 
 st.write("🎙️ Record audio below or 📁 upload an audio file.")
 
-# Audio recorder
 audio = mic_recorder(
     start_prompt="Start recording",
     stop_prompt="Stop recording",
@@ -623,7 +1087,6 @@ audio = mic_recorder(
 )
 audio_bytes: Optional[bytes] = audio["bytes"] if audio else None
 
-# File upload
 audio_file = st.file_uploader(
     "Or upload an audio file",
     type=["wav", "mp3", "ogg", "flac", "m4a", "aac", "amr", "opus", "wma", "webm"],
@@ -639,6 +1102,7 @@ if audio_bytes:
                 active_model,
                 model_or_pipe,
                 st.session_state.api_keys,
+                active_info,
             )
             chunks = transcription.get("chunks") or []
 
@@ -673,7 +1137,6 @@ if audio_bytes:
         except Exception as e:
             st.error(f"**Transcription error:** {e}")
 
-# Footer
 st.markdown(
     "<hr><footer><p style='text-align:center;'>© 2024 nyra health GmbH</p></footer>",
     unsafe_allow_html=True,
