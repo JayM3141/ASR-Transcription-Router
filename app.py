@@ -1,68 +1,44 @@
 import argparse
-import io
 import os
 import runpy
 import subprocess
 import sys
-import tempfile
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import moviepy as mp
-import numpy as np
 import streamlit as st
 import torch
 import torchaudio
-import torchaudio.transforms as T
 from streamlit_mic_recorder import mic_recorder
+
+from utils import (
+    HAS_CUDA,
+    audio_bytes_to_numpy,
+    audio_bytes_to_waveform,
+    build_whisper_pipeline,
+    check_optional_attr,
+    check_optional_import,
+    get_compute_dtype,
+    get_device,
+    get_torch_dtype,
+    make_transcription_result,
+    save_waveform,
+    temp_audio_file,
+)
 
 # ---------------------------------------------------------------------------
 # Optional framework detection (graceful – app works without them)
 # ---------------------------------------------------------------------------
-try:
-    import nemo.collections.asr as nemo_asr
-    NEMO_AVAILABLE = True
-except Exception:
-    NEMO_AVAILABLE = False
+nemo_asr, NEMO_AVAILABLE = check_optional_import("nemo.collections.asr")
+_, SPEECHBRAIN_AVAILABLE = check_optional_import("speechbrain")
+_, VOXTRAL_AVAILABLE = check_optional_attr("transformers", "VoxtralForConditionalGeneration")
+_, GLM_ASR_AVAILABLE = check_optional_attr("transformers", "GlmAsrForConditionalGeneration")
+_, MOSHI_AVAILABLE = check_optional_import("moshi")
+_, QWEN_ASR_AVAILABLE = check_optional_import("qwen_asr")
+_, ESPNET_AVAILABLE = check_optional_import("espnet2")
 
-try:
-    import speechbrain  # noqa: F401
-    SPEECHBRAIN_AVAILABLE = True
-except Exception:
-    SPEECHBRAIN_AVAILABLE = False
-
-try:
-    from transformers import VoxtralForConditionalGeneration  # noqa: F401
-    VOXTRAL_AVAILABLE = True
-except Exception:
-    VOXTRAL_AVAILABLE = False
-
-try:
-    from transformers import GlmAsrForConditionalGeneration  # noqa: F401
-    GLM_ASR_AVAILABLE = True
-except Exception:
-    GLM_ASR_AVAILABLE = False
-
-try:
-    import moshi  # noqa: F401
-    MOSHI_AVAILABLE = True
-except Exception:
-    MOSHI_AVAILABLE = False
-
-try:
-    import qwen_asr  # noqa: F401
-    QWEN_ASR_AVAILABLE = True
-except Exception:
-    QWEN_ASR_AVAILABLE = False
-
-try:
-    import espnet2  # noqa: F401
-    ESPNET_AVAILABLE = True
-except Exception:
-    ESPNET_AVAILABLE = False
-
-HAS_CUDA = torch.cuda.is_available()
-device: str = "cuda:0" if HAS_CUDA else "cpu"
-torch_dtype: torch.dtype = torch.float16 if HAS_CUDA else torch.float32
+device: str = get_device()
+torch_dtype: torch.dtype = get_torch_dtype()
 
 # ---------------------------------------------------------------------------
 # Model type constants
@@ -243,28 +219,10 @@ def is_api_type(t: str) -> bool:
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading model… this may take a few minutes on first run.")
 def load_transformers_pipeline(model_id: str, arch: str) -> Any:
-    from transformers import pipeline as hf_pipeline
     if arch == T_WHISPER:
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-        model = AutoModelForSpeechSeq2Seq.from_pretrained(
-            model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
-        )
-        model.to(device)
-        if hasattr(model, "generation_config"):
-            model.generation_config.median_filter_width = 3
-        processor = AutoProcessor.from_pretrained(model_id)
-        return hf_pipeline(
-            "automatic-speech-recognition",
-            model=model,
-            tokenizer=processor.tokenizer,
-            feature_extractor=processor.feature_extractor,
-            chunk_length_s=30,
-            batch_size=1,
-            return_timestamps=True,
-            torch_dtype=torch_dtype,
-            device=device,
-        )
+        return build_whisper_pipeline(model_id)
     else:
+        from transformers import pipeline as hf_pipeline
         return hf_pipeline(
             "automatic-speech-recognition",
             model=model_id,
@@ -316,7 +274,7 @@ def load_voxtral_model(model_id: str) -> Any:
     proc = AutoProcessor.from_pretrained(model_id)
     model = VoxtralForConditionalGeneration.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        torch_dtype=get_compute_dtype(prefer_bfloat16=True),
         device_map=device,
     )
     model.eval()
@@ -336,7 +294,7 @@ def load_generate_model(model_id: str, gen_class: str = "AutoModelForCausalLM") 
         )
     model = ModelCls.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        torch_dtype=get_compute_dtype(prefer_bfloat16=True),
         device_map=device,
     )
     model.eval()
@@ -350,7 +308,7 @@ def load_granite_model(model_id: str) -> Any:
     proc = AutoProcessor.from_pretrained(model_id)
     model = AutoModelForSpeechSeq2Seq.from_pretrained(
         model_id,
-        torch_dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        torch_dtype=get_compute_dtype(prefer_bfloat16=True),
         device_map=device,
     )
     model.eval()
@@ -371,7 +329,7 @@ def load_trust_remote_model(model_id: str, info: Dict[str, Any]) -> Any:
             proc = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
     model = AutoModel.from_pretrained(
         model_id,
-        torch_dtype=torch.float16 if HAS_CUDA else torch.float32,
+        torch_dtype=get_torch_dtype(),
         trust_remote_code=True,
         device_map=device,
     )
@@ -402,7 +360,7 @@ def load_qwen_asr_model(model_id: str) -> Any:
     from qwen_asr import Qwen3ASRModel
     model = Qwen3ASRModel.from_pretrained(
         model_id,
-        dtype=torch.bfloat16 if HAS_CUDA else torch.float32,
+        dtype=get_compute_dtype(prefer_bfloat16=True),
         device_map=device,
     )
     return model
@@ -429,7 +387,7 @@ def load_kyutai_model(model_id: str) -> Any:
             )
     from moshi import models as moshi_models
     moshi_device = "cuda" if HAS_CUDA else "cpu"
-    moshi_dtype = torch.bfloat16 if HAS_CUDA else torch.float32
+    moshi_dtype = get_compute_dtype(prefer_bfloat16=True)
     info = moshi_models.loaders.CheckpointInfo.from_hf_repo(model_id)
     mimi = info.get_mimi(device=moshi_device)
     tokenizer = info.get_text_tokenizer()
@@ -481,14 +439,9 @@ def load_espnet_model(model_id: str) -> Any:
 # Audio processing
 # ---------------------------------------------------------------------------
 def process_audio_bytes(audio_bytes: bytes) -> torch.Tensor:
-    audio_stream = io.BytesIO(audio_bytes)
-    waveform, sr = torchaudio.load(audio_stream, backend="ffmpeg")
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-    waveform = waveform.to(torch.float32)
-    if sr != 16000:
-        waveform = T.Resample(sr, 16000)(waveform)
-    torchaudio.save("sample.wav", waveform, sample_rate=16000, backend="ffmpeg")
+    """Decode audio bytes into a mono 16 kHz waveform and persist to sample.wav."""
+    waveform = audio_bytes_to_waveform(audio_bytes)
+    save_waveform(waveform, "sample.wav")
     return waveform
 
 
@@ -519,15 +472,16 @@ def timestamps_to_vtt(timestamps: List[Dict[str, Any]]) -> str:
 # Transcription functions per model type
 # ---------------------------------------------------------------------------
 def transcribe_transformers(audio_bytes: bytes, pipe: Any) -> Dict[str, Any]:
-    waveform = process_audio_bytes(audio_bytes)
-    return pipe(waveform[0, :].numpy(), return_timestamps="word")
+    process_audio_bytes(audio_bytes)
+    audio_np = audio_bytes_to_numpy(audio_bytes)
+    return pipe(audio_np, return_timestamps="word")
 
 
 def transcribe_nemo(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     process_audio_bytes(audio_bytes)
     results = model.transcribe(["sample.wav"])
     text = results[0] if isinstance(results[0], str) else results[0].text
-    return {"text": text, "chunks": []}
+    return make_transcription_result(text)
 
 
 def transcribe_speechbrain(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
@@ -537,49 +491,46 @@ def transcribe_speechbrain(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
         text = " ".join(str(r) for r in result).strip()
     else:
         text = str(result).strip()
-    return {"text": text, "chunks": []}
+    return make_transcription_result(text)
 
 
 def transcribe_voxtral(audio_bytes: bytes, model_and_proc: Any, model_id: str) -> Dict[str, Any]:
     """Voxtral: processor.apply_transcription_request per leaderboard voxtral/run_eval.py"""
     model, proc = model_and_proc
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
     inputs = proc.apply_transcription_request(
         language="en",
         audio=audio_np,
         model_id=model_id,
     )
-    inputs = inputs.to(model.device, dtype=torch.bfloat16 if HAS_CUDA else torch.float32)
+    inputs = inputs.to(model.device, dtype=get_compute_dtype(prefer_bfloat16=True))
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=448)
     decoded = proc.batch_decode(
         outputs[:, inputs.input_ids.shape[1]:],
         skip_special_tokens=True,
     )
-    return {"text": decoded[0].strip() if decoded else "", "chunks": []}
+    return make_transcription_result(decoded[0] if decoded else "")
 
 
 def transcribe_generate(audio_bytes: bytes, model_and_proc: Any) -> Dict[str, Any]:
     """Phi-4 / GLM ASR: processor.apply_transcription_request(audios) per leaderboard phi/ and glm_asr/."""
     model, proc = model_and_proc
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
     inputs = proc.apply_transcription_request([audio_np])
     inputs = inputs.to(model.device, dtype=model.dtype)
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=448, do_sample=False)
     input_len = inputs["input_ids"].shape[1] if "input_ids" in inputs else 0
     decoded = proc.batch_decode(outputs[:, input_len:], skip_special_tokens=True)
-    return {"text": decoded[0].strip() if decoded else "", "chunks": []}
+    return make_transcription_result(decoded[0] if decoded else "")
 
 
 def transcribe_granite(audio_bytes: bytes, model_and_proc: Any) -> Dict[str, Any]:
     """IBM Granite Speech: chat-template + AutoModelForSpeechSeq2Seq per leaderboard granite/run_eval.py"""
     model, proc = model_and_proc
     tokenizer = proc.tokenizer
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
 
     chat = [
         {
@@ -617,17 +568,15 @@ def transcribe_granite(audio_bytes: bytes, model_and_proc: Any) -> Dict[str, Any
     num_input_tokens = model_inputs["input_ids"].shape[-1]
     new_tokens = outputs[:, num_input_tokens:]
     text_out = tokenizer.batch_decode(new_tokens, add_special_tokens=False, skip_special_tokens=True)
-    return {"text": text_out[0].strip() if text_out else "", "chunks": []}
+    return make_transcription_result(text_out[0] if text_out else "")
 
 
 def transcribe_trust_remote(audio_bytes: bytes, model_and_proc: Any, info: Dict[str, Any]) -> Dict[str, Any]:
     """HiggsAudio / LiteASR: AutoModel trust_remote_code per leaderboard higgs_audio/ and liteASR/."""
     model, proc = model_and_proc
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
 
     is_higgs = info.get("higgs", False)
-    is_lite = info.get("lite_asr", False)
 
     if is_higgs:
         # HiggsAudio: dynamically load transcribe_batch from the model repo
@@ -646,11 +595,11 @@ def transcribe_trust_remote(audio_bytes: bytes, model_and_proc: Any, info: Dict[
         tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         results = transcribe_batch_fn(model, tokenizer, [(audio_np, 16000)])
         text = results[0] if results else ""
-        return {"text": text.strip() if text else "", "chunks": []}
+        return make_transcription_result(text)
     else:
         # LiteASR: standard whisper-processor + model.generate()
         inputs = proc(audio_np, return_tensors="pt", sampling_rate=16000)
-        inputs = inputs.to(model.device, dtype=torch.float16 if HAS_CUDA else torch.float32)
+        inputs = inputs.to(model.device, dtype=get_torch_dtype())
         with torch.no_grad():
             if hasattr(model, "can_generate") and model.can_generate():
                 outputs = model.generate(**inputs, max_new_tokens=224)
@@ -659,17 +608,16 @@ def transcribe_trust_remote(audio_bytes: bytes, model_and_proc: Any, info: Dict[
                 logits = model(**inputs).logits
                 predicted_ids = torch.argmax(logits, dim=-1)
                 text = proc.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-        return {"text": text.strip(), "chunks": []}
+        return make_transcription_result(text)
 
 
 def transcribe_qwen_asr(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     """Qwen3-ASR: Qwen3ASRModel.transcribe per leaderboard qwen/run_eval.py"""
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
     audio_inputs = [(audio_np, 16000)]
     results = model.transcribe(audio=audio_inputs, language="English")
     text = results[0].text if results else ""
-    return {"text": text.strip(), "chunks": []}
+    return make_transcription_result(text)
 
 
 def transcribe_kyutai(audio_bytes: bytes, model_components: Any) -> Dict[str, Any]:
@@ -678,7 +626,7 @@ def transcribe_kyutai(audio_bytes: bytes, model_components: Any) -> Dict[str, An
     mimi, tokenizer, _lm, lm_gen, padding_token_id, silence_prefix_s, delay_s = model_components
     moshi_device = "cuda" if HAS_CUDA else "cpu"
 
-    waveform = process_audio_bytes(audio_bytes)
+    waveform = audio_bytes_to_waveform(audio_bytes)
     audio_16k = waveform[0]
     # Resample from 16kHz to 24kHz (moshi native rate)
     audio_24k = julius.resample.resample_frac(audio_16k, old_sr=16000, new_sr=24000)
@@ -710,13 +658,12 @@ def transcribe_kyutai(audio_bytes: bytes, model_components: Any) -> Dict[str, An
                             text_tokens.append(text_t)
 
     text = tokenizer.decode(text_tokens) if text_tokens else ""
-    return {"text": text.strip(), "chunks": []}
+    return make_transcription_result(text)
 
 
 def transcribe_espnet(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     """ESPnet OWSM CTC: Speech2TextGreedySearch.batch_decode per leaderboard espnet/run_eval.py"""
-    waveform = process_audio_bytes(audio_bytes)
-    audio_np = waveform[0].numpy()
+    audio_np = audio_bytes_to_numpy(audio_bytes)
     with torch.inference_mode():
         pred_text = model.batch_decode(
             [audio_np],
@@ -724,16 +671,13 @@ def transcribe_espnet(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
             context_len_in_secs=4,
         )
     text = pred_text[0] if pred_text else ""
-    return {"text": text.strip(), "chunks": []}
+    return make_transcription_result(text)
 
 
 def transcribe_assemblyai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
     import assemblyai as aai
     aai.settings.api_key = api_key
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
-    try:
+    with temp_audio_file(audio_bytes) as tmp_path:
         config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.best, word_boost=[])
         transcriber = aai.Transcriber(config=config)
         transcript = transcriber.transcribe(tmp_path)
@@ -744,18 +688,13 @@ def transcribe_assemblyai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
             for w in transcript.words:
                 chunks.append({"text": " " + w.text, "timestamp": (w.start / 1000.0, w.end / 1000.0)})
         return {"text": transcript.text or "", "chunks": chunks}
-    finally:
-        os.unlink(tmp_path)
 
 
 def transcribe_elevenlabs(audio_bytes: bytes, api_key: str, model_id: str) -> Dict[str, Any]:
     from elevenlabs.client import ElevenLabs
     client = ElevenLabs(api_key=api_key)
     el_model = "scribe_v2" if "v2" in model_id else "scribe_v1"
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
-    try:
+    with temp_audio_file(audio_bytes) as tmp_path:
         with open(tmp_path, "rb") as audio_file:
             result = client.speech_to_text.convert(audio=audio_file, model_id=el_model)
         chunks = []
@@ -763,18 +702,13 @@ def transcribe_elevenlabs(audio_bytes: bytes, api_key: str, model_id: str) -> Di
             for w in result.words:
                 chunks.append({"text": " " + w.text, "timestamp": (w.start, w.end)})
         return {"text": result.text or "", "chunks": chunks}
-    finally:
-        os.unlink(tmp_path)
 
 
 def transcribe_revai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
     from rev_ai import apiclient
     import time
     client = apiclient.RevAiAPIClient(api_key)
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        f.write(audio_bytes)
-        tmp_path = f.name
-    try:
+    with temp_audio_file(audio_bytes) as tmp_path:
         job = client.submit_job_local_file(tmp_path)
         while True:
             details = client.get_job_details(job.id)
@@ -791,8 +725,6 @@ def transcribe_revai(audio_bytes: bytes, api_key: str) -> Dict[str, Any]:
                     text_parts.append(elem.value)
                     chunks.append({"text": " " + elem.value, "timestamp": (elem.ts, elem.end_ts)})
         return {"text": " ".join(text_parts), "chunks": chunks}
-    finally:
-        os.unlink(tmp_path)
 
 
 def transcribe_audio(
