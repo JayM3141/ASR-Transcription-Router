@@ -1,10 +1,13 @@
 import argparse
+import html
 import io
 import os
+import re
 import runpy
 import subprocess
 import sys
 import tempfile
+import uuid
 from typing import Any, Dict, List, Optional, Union
 
 import moviepy as mp
@@ -488,7 +491,18 @@ def process_audio_bytes(audio_bytes: bytes) -> torch.Tensor:
     waveform = waveform.to(torch.float32)
     if sr != 16000:
         waveform = T.Resample(sr, 16000)(waveform)
-    torchaudio.save("sample.wav", waveform, sample_rate=16000, backend="ffmpeg")
+    # Use a unique temp file to avoid race conditions in concurrent sessions
+    tmp_wav = os.path.join(tempfile.gettempdir(), f"asr_{uuid.uuid4().hex}.wav")
+    torchaudio.save(tmp_wav, waveform, sample_rate=16000, backend="ffmpeg")
+    # Store path for downstream functions that need the file
+    if "_asr_tmp_wav" not in st.session_state:
+        st.session_state["_asr_tmp_wav"] = tmp_wav
+    else:
+        # Clean up previous temp file
+        prev = st.session_state["_asr_tmp_wav"]
+        if prev and os.path.exists(prev):
+            os.unlink(prev)
+        st.session_state["_asr_tmp_wav"] = tmp_wav
     return waveform
 
 
@@ -525,14 +539,16 @@ def transcribe_transformers(audio_bytes: bytes, pipe: Any) -> Dict[str, Any]:
 
 def transcribe_nemo(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     process_audio_bytes(audio_bytes)
-    results = model.transcribe(["sample.wav"])
+    tmp_wav = st.session_state.get("_asr_tmp_wav", "sample.wav")
+    results = model.transcribe([tmp_wav])
     text = results[0] if isinstance(results[0], str) else results[0].text
     return {"text": text, "chunks": []}
 
 
 def transcribe_speechbrain(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     process_audio_bytes(audio_bytes)
-    result = model.transcribe_file("sample.wav")
+    tmp_wav = st.session_state.get("_asr_tmp_wav", "sample.wav")
+    result = model.transcribe_file(tmp_wav)
     if isinstance(result, (list, tuple)):
         text = " ".join(str(r) for r in result).strip()
     else:
@@ -912,6 +928,12 @@ custom_model_id = st.sidebar.text_input(
     placeholder="e.g. openai/whisper-medium",
 )
 
+# Validate custom model ID to prevent path traversal and command injection
+_MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+if custom_model_id.strip() and not _MODEL_ID_PATTERN.match(custom_model_id.strip()):
+    st.sidebar.error("Invalid model ID format. Expected: `owner/model-name`")
+    custom_model_id = ""
+
 active_model = custom_model_id.strip() if custom_model_id.strip() else selected_model
 active_info = get_model_info(active_model)
 active_type = active_info["type"]
@@ -1110,14 +1132,16 @@ if audio_bytes:
                 vtt = timestamps_to_vtt(chunks)
                 with open("subtitles.vtt", "w") as f:
                     f.write(vtt)
-                wav_to_black_mp4("sample.wav", "video.mp4")
+                _tmp_wav = st.session_state.get("_asr_tmp_wav", "sample.wav")
+                wav_to_black_mp4(_tmp_wav, "video.mp4")
                 st.video("video.mp4", subtitles="subtitles.vtt")
 
             st.subheader("Transcription")
+            _escaped_text = html.escape(transcription.get("text", "").strip())
             st.markdown(
                 f"""<div style="background:#f0f0f0;padding:12px;border-radius:6px;">
                     <p style="font-size:16px;color:#333;margin:0;">
-                        {transcription.get("text","").strip()}
+                        {_escaped_text}
                     </p></div>""",
                 unsafe_allow_html=True,
             )
