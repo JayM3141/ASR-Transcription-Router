@@ -1,8 +1,11 @@
 import argparse
+import logging
 import os
 import sys
 import torch
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
+
+logger = logging.getLogger(__name__)
 
 
 def transcribe_audio(file_path):
@@ -11,12 +14,18 @@ def transcribe_audio(file_path):
 
     model_id = "nyrahealth/CrisperWhisper"  # You can change this to a different model if needed
 
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
-    )
+    try:
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id, torch_dtype=torch_dtype, low_cpu_mem_usage=True, use_safetensors=True
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model '{model_id}': {e}") from e
     model.to(device)
 
-    processor = AutoProcessor.from_pretrained(model_id)
+    try:
+        processor = AutoProcessor.from_pretrained(model_id)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load processor for '{model_id}': {e}") from e
 
     pipe = pipeline(
         "automatic-speech-recognition",
@@ -31,6 +40,8 @@ def transcribe_audio(file_path):
     )
 
     result = pipe(file_path)
+    if result is None:
+        raise RuntimeError("Transcription pipeline returned no result.")
     return result
 
 
@@ -48,7 +59,8 @@ def main():
         print("Transcription:")
         print(transcription["text"])
     except Exception as e:
-        print(f"An error occurred while transcribing the audio: {str(e)}")
+        logger.error("Transcription failed", exc_info=True)
+        print(f"An error occurred while transcribing the audio: {e}", file=sys.stderr)
         sys.exit(1)
 
 

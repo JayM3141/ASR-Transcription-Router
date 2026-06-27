@@ -280,7 +280,13 @@ def load_speechbrain_model(model_id: str, sb_class: str) -> Any:
     try:
         from speechbrain.inference.ASR import EncoderASR, EncoderDecoderASR
     except ImportError:
-        from speechbrain.pretrained import EncoderASR, EncoderDecoderASR  # type: ignore[no-redef]
+        try:
+            from speechbrain.pretrained import EncoderASR, EncoderDecoderASR  # type: ignore[no-redef]
+        except ImportError:
+            raise RuntimeError(
+                f"Could not import SpeechBrain ASR classes (tried both speechbrain.inference.ASR "
+                f"and speechbrain.pretrained). Your SpeechBrain version may be incompatible."
+            )
     cls_map = {"EncoderASR": EncoderASR, "EncoderDecoderASR": EncoderDecoderASR}
     cls = cls_map.get(sb_class, EncoderASR)
     savedir = f"pretrained_models/{model_id.replace('/', '_')}"
@@ -367,7 +373,12 @@ def load_trust_remote_model(model_id: str, info: Dict[str, Any]) -> Any:
     else:
         try:
             proc = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        except Exception:
+        except Exception as proc_err:
+            import warnings
+            warnings.warn(
+                f"Failed to load processor for '{model_id}': {proc_err}. "
+                f"Falling back to 'openai/whisper-large-v3-turbo' processor."
+            )
             proc = AutoProcessor.from_pretrained("openai/whisper-large-v3-turbo")
     model = AutoModel.from_pretrained(
         model_id,
@@ -383,22 +394,21 @@ def load_trust_remote_model(model_id: str, info: Dict[str, Any]) -> Any:
 def load_qwen_asr_model(model_id: str) -> Any:
     """Load Qwen3-ASR via the qwen_asr package per the leaderboard."""
     if not QWEN_ASR_AVAILABLE:
-        # Try to install qwen_asr
+        install_err = None
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "qwen_asr", "--no-deps", "-q"],
                 timeout=120,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            install_err = e
         try:
             import qwen_asr as _qa  # noqa: F401
         except ImportError:
-            raise RuntimeError(
-                "qwen_asr package is not installed.\n"
-                "Run: pip install qwen_asr\n"
-                "Then restart the app."
-            )
+            msg = "qwen_asr package is not installed.\nRun: pip install qwen_asr\nThen restart the app."
+            if install_err is not None:
+                msg += f"\n\nAuto-install failed: {install_err}"
+            raise RuntimeError(msg)
     from qwen_asr import Qwen3ASRModel
     model = Qwen3ASRModel.from_pretrained(
         model_id,
@@ -412,21 +422,21 @@ def load_qwen_asr_model(model_id: str) -> Any:
 def load_kyutai_model(model_id: str) -> Any:
     """Load Kyutai STT using the moshi library per the leaderboard."""
     if not MOSHI_AVAILABLE:
+        install_err = None
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", "moshi", "julius", "-q"],
                 timeout=180,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            install_err = e
         try:
             import moshi  # noqa: F401
         except ImportError:
-            raise RuntimeError(
-                "moshi package is not installed.\n"
-                "Run: pip install moshi julius\n"
-                "Then restart the app."
-            )
+            msg = "moshi package is not installed.\nRun: pip install moshi julius\nThen restart the app."
+            if install_err is not None:
+                msg += f"\n\nAuto-install failed: {install_err}"
+            raise RuntimeError(msg)
     from moshi import models as moshi_models
     moshi_device = "cuda" if HAS_CUDA else "cpu"
     moshi_dtype = torch.bfloat16 if HAS_CUDA else torch.float32
@@ -445,6 +455,7 @@ def load_kyutai_model(model_id: str) -> Any:
 def load_espnet_model(model_id: str) -> Any:
     """Load ESPnet OWSM CTC model using espnet2 per the leaderboard."""
     if not ESPNET_AVAILABLE:
+        install_err = None
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install",
@@ -453,16 +464,19 @@ def load_espnet_model(model_id: str) -> Any:
                  "-q"],
                 timeout=300,
             )
-        except Exception:
-            pass
+        except Exception as e:
+            install_err = e
         try:
             import espnet2  # noqa: F401
         except ImportError:
-            raise RuntimeError(
+            msg = (
                 "ESPnet is not installed.\n"
                 "Run: pip install 'espnet @ git+https://github.com/espnet/espnet'\n"
                 "Then restart the app."
             )
+            if install_err is not None:
+                msg += f"\n\nAuto-install failed: {install_err}"
+            raise RuntimeError(msg)
     from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
     load_args: Dict[str, Any] = {
         "device": "cpu",
@@ -481,14 +495,27 @@ def load_espnet_model(model_id: str) -> Any:
 # Audio processing
 # ---------------------------------------------------------------------------
 def process_audio_bytes(audio_bytes: bytes) -> torch.Tensor:
+    if not audio_bytes:
+        raise ValueError("Received empty audio data. Please provide a valid audio file.")
     audio_stream = io.BytesIO(audio_bytes)
-    waveform, sr = torchaudio.load(audio_stream, backend="ffmpeg")
+    try:
+        waveform, sr = torchaudio.load(audio_stream, backend="ffmpeg")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to decode audio data. The file may be corrupted or in an "
+            f"unsupported format. Details: {e}"
+        ) from e
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
     waveform = waveform.to(torch.float32)
     if sr != 16000:
         waveform = T.Resample(sr, 16000)(waveform)
-    torchaudio.save("sample.wav", waveform, sample_rate=16000, backend="ffmpeg")
+    try:
+        torchaudio.save("sample.wav", waveform, sample_rate=16000, backend="ffmpeg")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to save processed audio to disk. Details: {e}"
+        ) from e
     return waveform
 
 
@@ -526,6 +553,8 @@ def transcribe_transformers(audio_bytes: bytes, pipe: Any) -> Dict[str, Any]:
 def transcribe_nemo(audio_bytes: bytes, model: Any) -> Dict[str, Any]:
     process_audio_bytes(audio_bytes)
     results = model.transcribe(["sample.wav"])
+    if not results:
+        raise RuntimeError("NeMo model returned no transcription results.")
     text = results[0] if isinstance(results[0], str) else results[0].text
     return {"text": text, "chunks": []}
 
