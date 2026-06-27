@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Model weights and caches
+pretrained_models/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# Temp files produced at runtime
+sample.wav
+video.mp4
+subtitles.vtt
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml

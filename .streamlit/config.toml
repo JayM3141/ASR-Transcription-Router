@@ -1,10 +1,11 @@
 [browser]
 gatherUsageStats = false
+
 [server]
 headless = true
 port = 5000
 address = '0.0.0.0'
-maxUploadSize = 5120
-enableCORS = false
-enableXsrfProtection = false
+maxUploadSize = 200
+enableCORS = true
+enableXsrfProtection = true
 
